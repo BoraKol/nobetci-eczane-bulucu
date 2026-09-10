@@ -5,10 +5,18 @@ from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_community.document_loaders import PyPDFLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+try:
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+except ImportError:
+    from langchain.text_splitter import RecursiveCharacterTextSplitter
+
 from langchain.chains import ConversationalRetrievalChain
 from langchain.memory import ConversationBufferMemory
-from langchain.schema import AIMessage, HumanMessage
+
+try:
+    from langchain_core.messages import AIMessage, HumanMessage
+except ImportError:
+    from langchain.schema import AIMessage, HumanMessage
 
 from duty_pharmacy import (
     get_duty_pharmacies,
@@ -20,10 +28,15 @@ from duty_pharmacy import (
 load_dotenv()
 api_key = os.getenv("OPENAI_API_KEY")
 
+# Streamlit Cloud secrets kontrolü
 if not api_key:
-    raise ValueError("OPENAI_API_KEY is not found")
+    try:
+        api_key = st.secrets.get("OPENAI_API_KEY")
+    except Exception:
+        api_key = None
 
-os.environ["OPENAI_API_KEY"] = api_key
+if api_key:
+    os.environ["OPENAI_API_KEY"] = api_key
 
 st.set_page_config(
     page_title="Ecza ve Nöbetçi Eczane Danışmanı",
@@ -36,7 +49,7 @@ st.set_page_config(
 def load_vector_db():
     """PDF dosyasını sadece 1 defa yükleyip vektör veritabanını önbelleğe alır."""
     pdf_path = "recetesiz_ilac_listesi.pdf"
-    if not os.path.exists(pdf_path):
+    if not os.path.exists(pdf_path) or not os.getenv("OPENAI_API_KEY"):
         return None
     try:
         loader = PyPDFLoader(pdf_path)
