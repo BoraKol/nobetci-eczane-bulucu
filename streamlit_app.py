@@ -2,21 +2,15 @@ import os
 import streamlit as st
 from dotenv import load_dotenv
 
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+import google.generativeai as genai
+from langchain_core.embeddings import Embeddings
 from langchain_community.vectorstores import FAISS
 from langchain_community.document_loaders import PyPDFLoader
+
 try:
     from langchain_text_splitters import RecursiveCharacterTextSplitter
 except ImportError:
     from langchain.text_splitter import RecursiveCharacterTextSplitter
-
-from langchain.chains import ConversationalRetrievalChain
-from langchain.memory import ConversationBufferMemory
-
-try:
-    from langchain_core.messages import AIMessage, HumanMessage
-except ImportError:
-    from langchain.schema import AIMessage, HumanMessage
 
 from duty_pharmacy import (
     get_duty_pharmacies,
@@ -26,17 +20,17 @@ from duty_pharmacy import (
 )
 
 load_dotenv()
-api_key = os.getenv("OPENAI_API_KEY")
 
-# Streamlit Cloud secrets kontrolü
-if not api_key:
+# API Anahtarı: Önce .env, sonra Streamlit Cloud secrets
+gemini_key = os.getenv("GEMINI_API_KEY")
+if not gemini_key:
     try:
-        api_key = st.secrets.get("OPENAI_API_KEY")
+        gemini_key = st.secrets.get("GEMINI_API_KEY")
     except Exception:
-        api_key = None
+        gemini_key = None
 
-if api_key:
-    os.environ["OPENAI_API_KEY"] = api_key
+if gemini_key:
+    genai.configure(api_key=gemini_key)
 
 st.set_page_config(
     page_title="Ecza ve Nöbetçi Eczane Danışmanı",
@@ -44,29 +38,54 @@ st.set_page_config(
     layout="wide"
 )
 
+# --- ÜCRETSİZ GEMINI EMBEDDING WRAPPER ---
+class GeminiEmbeddings(Embeddings):
+    def __init__(self, api_key: str, model: str = "models/gemini-embedding-001"):
+        genai.configure(api_key=api_key)
+        self.model = model
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        # Toplu embedding çağrısı
+        results = []
+        for text in texts:
+            try:
+                res = genai.embed_content(model=self.model, content=text)
+                results.append(res['embedding'])
+            except Exception as e:
+                print(f"Embedding hatası: {e}")
+                results.append([0.0] * 3072)
+        return results
+
+    def embed_query(self, text: str) -> list[float]:
+        try:
+            res = genai.embed_content(model=self.model, content=text)
+            return res['embedding']
+        except Exception as e:
+            print(f"Query embedding hatası: {e}")
+            return [0.0] * 3072
+
 # --- CACHED RESOURCES ---
 @st.cache_resource(show_spinner="Reçetesiz ilaç veritabanı yükleniyor...")
-def load_vector_db():
-    """PDF dosyasını sadece 1 defa yükleyip vektör veritabanını önbelleğe alır."""
+def load_vector_db(api_key: str):
+    """PDF dosyasını yükleyip ücretsiz Gemini Embedding ile FAISS veritabanını önbelleğe alır."""
     pdf_path = "recetesiz_ilac_listesi.pdf"
-    if not os.path.exists(pdf_path) or not os.getenv("OPENAI_API_KEY"):
+    if not os.path.exists(pdf_path) or not api_key:
         return None
     try:
         loader = PyPDFLoader(pdf_path)
         documents = loader.load()
         splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
         docs = splitter.split_documents(documents)
-        embedding = OpenAIEmbeddings(model="text-embedding-3-large")
-        return FAISS.from_documents(docs, embedding)
+        embeddings = GeminiEmbeddings(api_key=api_key)
+        return FAISS.from_documents(docs, embeddings)
     except Exception as e:
-        # OpenAI quota aşımı veya bağlantı hatası durumunda uygulamanın çökmesini engeller
-        print(f"Vektör veritabanı yükleme hatası: {e}")
+        print(f"Vektör veritabanı oluşturma hatası: {e}")
         return None
 
 # --- SIDEBAR: HIZLI NÖBETÇİ ECZANE PANELİ ---
 with st.sidebar:
     st.header("🚨 Canlı Nöbetçi Eczane Sorgula")
-    st.caption("Ne olursa olsun **sadece ve sadece şu an açık olan nöbetçi eczaneler** listelenir. Kapalı hiçbir eczane gösterilmez.")
+    st.caption("Ücretsiz ve canlı veri: Ne olursa olsun **sadece ve sadece şu an açık olan nöbetçi eczaneler** listelenir.")
     
     selected_city = st.selectbox(
         "İl Seçin:",
@@ -103,31 +122,10 @@ with st.sidebar:
 
 # --- MAIN PAGE HEADER ---
 st.title("💊 İlaç ve Nöbetçi Eczane Danışmanı")
-st.write("Şikayetinizi belirtin, reçetesiz ilaç tavsiyesi alın veya bulunduğunuz şehri yazarak **yalnızca o an açık olan güncel NÖBETÇİ eczaneleri** anında listeleyin.")
+st.write("Şikayetinizi belirtin, reçetesiz ilaç tavsiyesi alın veya bulunduğunuz şehri yazarak **yalnızca o an açık olan güncel NÖBETÇİ eczaneleri** anında listeleyin. *(Tamamen Ücretsiz API - Google Gemini & Canlı Eczane Servisi)*")
 
-# Vector DB & QA Chain setup
-vector_db = load_vector_db()
-
-if "memory" not in st.session_state:
-    st.session_state.memory = ConversationBufferMemory(
-        memory_key="chat_history",
-        return_messages=True
-    )
-
-if "qa_chain" not in st.session_state and vector_db is not None:
-    try:
-        llm = ChatOpenAI(
-            model_name="gpt-4o-mini",
-            temperature=0.1
-        )
-        st.session_state.qa_chain = ConversationalRetrievalChain.from_llm(
-            llm=llm,
-            retriever=vector_db.as_retriever(search_kwargs={"k": 3}),
-            memory=st.session_state.memory
-        )
-    except Exception as e:
-        st.session_state.qa_chain = None
-        print(f"QA Chain başlatma hatası: {e}")
+# Vektör veritabanını yükle
+vector_db = load_vector_db(gemini_key) if gemini_key else None
 
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
@@ -136,7 +134,10 @@ if "chat_history" not in st.session_state:
 col1, col2 = st.columns([1, 2])
 
 with col1:
-    user_question = st.text_input("👤 Şikayetinizi veya aradığınız şehri yazın:", placeholder="Örn: Kadıköy'de nöbetçi eczane veya Başım ağrıyor")
+    user_question = st.text_input(
+        "👤 Şikayetinizi veya aradığınız şehri yazın:",
+        placeholder="Örn: Kadıköy'de nöbetçi eczane veya Başım ağrıyor"
+    )
     send_btn = st.button("Gönder", use_container_width=True)
 
     if send_btn and user_question:
@@ -161,26 +162,41 @@ with col1:
                     "⚠️ **Önemli Kural:** Ne olursa olsun sistemimiz kapalı veya nöbetçi olmayan hiçbir eczaneyi listelemez; sadece şu an açık olan resmi nöbetçi eczaneleri getirir."
                 )
         else:
-            # 2. Semptom / Reçetesiz İlaç Rehberi Sorgusu
-            if "qa_chain" in st.session_state and st.session_state.qa_chain is not None:
-                try:
-                    response = st.session_state.qa_chain.invoke(user_question)
-                    answer = response.get("answer", "Yanıt alınamadı.")
-                except Exception as e:
-                    err_msg = str(e)
-                    if "insufficient_quota" in err_msg or "429" in err_msg:
-                        answer = (
-                            "⚠️ **OpenAI API Kotası Uyarısı:** OpenAI API hesabınızın kullanım kotası dolmuş görünüyor. "
-                            "Ancak nöbetçi eczane sorgulama sistemimiz canlı ve kesintisiz çalışmaktadır! "
-                            "İl veya ilçe adını yazarak (örn: *İstanbul Kadıköy*, *Ankara*) açık nöbetçi eczaneleri sorgulayabilirsiniz."
-                        )
-                    else:
-                        answer = f"Yanıt oluşturulurken bir hata meydana geldi: {err_msg}"
-            else:
+            # 2. Semptom / Reçetesiz İlaç Rehberi Sorgusu (Ücretsiz Google Gemini ile)
+            if not gemini_key:
                 answer = (
-                    "Reçetesiz ilaç veritabanı şu an çevrimdışı. "
-                    "Ancak nöbetçi eczane arama sistemimiz aktiftir. Nöbetçi eczane öğrenmek istediğiniz ili yazabilirsiniz."
+                    "⚠️ Reçetesiz ilaç danışmanlığı için `GEMINI_API_KEY` gereklidir. "
+                    "Google AI Studio üzerinden ücretsiz bir API anahtarı alıp `.env` veya Streamlit Cloud Secrets alanına ekleyebilirsiniz. "
+                    "\n\nNöbetçi eczane arama sistemi API anahtarı gerektirmeden çalışmaktadır! Bir il/ilçe yazarak nöbetçi eczaneleri sorgulayabilirsiniz."
                 )
+            else:
+                try:
+                    # Benzer belgeleri FAISS'ten çek
+                    context = ""
+                    if vector_db:
+                        relevant_docs = vector_db.similarity_search(user_question, k=3)
+                        context = "\n---\n".join([d.page_content for d in relevant_docs])
+
+                    # Gemini Modeli ile yanıt üret
+                    model = genai.GenerativeModel("gemini-flash-latest")
+                    prompt = f"""Sen Türkçe hizmet veren uzman bir Ecza ve Sağlık Danışmanı AI asistanısın.
+Aşağıda reçetesiz ilaç kılavuzundan alınan resmi bilgiler yer almaktadır:
+-------------------
+{context}
+-------------------
+
+Kullanıcı Sorusu/Şikayeti: {user_question}
+
+Yönergeler:
+1. Reçetesiz ilaç kılavuzundaki bilgilere dayanarak kullanıcının şikayetine uygun reçetesiz ilaç önerileri, kullanım talimatı ve uyarıları açıkla.
+2. Ciddi durumlarda mutlaka hekime veya en yakın nöbetçi eczacıya başvurulması gerektiğini hatırlat.
+3. Asla kendi hafızandan rastgele eczane ismi uydurma.
+4. Yanıtını anlaşılır, sıcak ve profesyonel Türkçe ile yaz."""
+
+                    response = model.generate_content(prompt)
+                    answer = response.text if response and response.text else "Yanıt alınamadı."
+                except Exception as e:
+                    answer = f"Yanıt oluşturulurken bir hata meydana geldi: {str(e)}"
 
         st.session_state.chat_history.append(("👤", user_question))
         st.session_state.chat_history.append(("🤖", answer))
@@ -191,8 +207,6 @@ with col2:
 
         if st.button("🧹 Sohbeti Temizle"):
             st.session_state.chat_history = []
-            if "memory" in st.session_state and st.session_state.memory is not None:
-                st.session_state.memory.clear()
             st.rerun()
 
         for role, content in st.session_state.chat_history:
@@ -201,5 +215,3 @@ with col2:
             elif role == "🤖":
                 st.markdown(f"**🤖 Asistan:**\n\n{content}")
             st.markdown("---")
-
-# NOT: Sadece reçetesiz ilaç/semptom ve doğrulanmış nöbetçi eczane bilgileri sunulur.
